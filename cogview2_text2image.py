@@ -15,6 +15,7 @@ import torch
 import argparse
 from functools import partial
 import numpy as np
+import gradio as gr
 
 from SwissArmyTransformer import get_args, get_tokenizer
 from SwissArmyTransformer.model import CachedAutoregressiveModel
@@ -58,104 +59,110 @@ def main(args):
         srg = SRGroup(args)
         
     def process(raw_text):
-        if args.with_id:
-            query_id, raw_text = raw_text.split('\t')
-        print('raw text: ', raw_text)
-        text = query_template.format(raw_text)
-        seq = tokenizer.encode(text)
-        if len(seq) > 110:
-            raise ValueError('text too long.')
-        
-        txt_len = len(seq) - 1
-        seq = torch.tensor(seq + [-1]*400, device=args.device)
-        # calibrate text length
-        log_attention_weights = torch.zeros(len(seq), len(seq), 
-            device=args.device, dtype=torch.half if args.fp16 else torch.float32)
-        log_attention_weights[:, :txt_len] = args.attn_plus
-        # generation
-        mbz = args.max_inference_batch_size
-        assert args.batch_size < mbz or args.batch_size % mbz == 0
-        get_func = partial(get_masks_and_position_ids_coglm, context_length=txt_len)
-        output_list, score_list = [], []
+        with torch.no_grad():
+            if args.with_id:
+                query_id, raw_text = raw_text.split('\t')
+            print('raw text: ', raw_text)
+            text = query_template.format(raw_text)
+            seq = tokenizer.encode(text)
+            if len(seq) > 110:
+                raise ValueError('text too long.')
 
-        for tim in range(max(args.batch_size // mbz, 1)):
-            strategy.start_pos = txt_len + 1
-            coarse_samples = filling_sequence(model, seq.clone(),
-                    batch_size=min(args.batch_size, mbz),
-                    strategy=strategy,
-                    log_attention_weights=log_attention_weights,
-                    get_masks_and_position_ids=get_func
-                    )[0]
-            
-            # get ppl for inverse prompting
+            txt_len = len(seq) - 1
+            seq = torch.tensor(seq + [-1]*400, device=args.device)
+            # calibrate text length
+            log_attention_weights = torch.zeros(len(seq), len(seq), 
+                device=args.device, dtype=torch.half if args.fp16 else torch.float32)
+            log_attention_weights[:, :txt_len] = args.attn_plus
+            # generation
+            mbz = args.max_inference_batch_size
+            assert args.batch_size < mbz or args.batch_size % mbz == 0
+            get_func = partial(get_masks_and_position_ids_coglm, context_length=txt_len)
+            output_list, score_list = [], []
+
+            for tim in range(max(args.batch_size // mbz, 1)):
+                strategy.start_pos = txt_len + 1
+                coarse_samples = filling_sequence(model, seq.clone(),
+                        batch_size=min(args.batch_size, mbz),
+                        strategy=strategy,
+                        log_attention_weights=log_attention_weights,
+                        get_masks_and_position_ids=get_func
+                        )[0]
+
+                # get ppl for inverse prompting
+                if args.inverse_prompt:
+                    image_text_seq = torch.cat(
+                        (
+                            coarse_samples[:, -400:],
+                            torch.tensor([tokenizer['<start_of_chinese>']]+tokenizer.encode(raw_text), device=args.device).expand(coarse_samples.shape[0], -1)
+                        ), dim=1)
+                    seqlen = image_text_seq.shape[1]
+                    attention_mask = torch.zeros(seqlen, seqlen, device=args.device, dtype=torch.long)
+                    attention_mask[:, :400] = 1
+                    attention_mask[400:, 400:] = 1
+                    attention_mask[400:, 400:].tril_()
+                    position_ids = torch.zeros(seqlen, device=args.device, dtype=torch.long)
+                    torch.arange(513, 513+400, out=position_ids[:400])
+                    torch.arange(0, seqlen-400, out=position_ids[400:])
+                    loss_mask = torch.zeros(seqlen, device=args.device, dtype=torch.long)
+                    loss_mask[401:] = 1
+                    scores = evaluate_perplexity(
+                        text_model, image_text_seq, attention_mask,
+                        position_ids, loss_mask#, invalid_slices=[slice(0, 20000)], reduction='mean'
+                    )
+                    score_list.extend(scores.tolist())
+                    # ---------------------
+
+                output_list.append(
+                        coarse_samples
+                    )
+            output_tokens = torch.cat(output_list, dim=0)
+
             if args.inverse_prompt:
-                image_text_seq = torch.cat(
-                    (
-                        coarse_samples[:, -400:],
-                        torch.tensor([tokenizer['<start_of_chinese>']]+tokenizer.encode(raw_text), device=args.device).expand(coarse_samples.shape[0], -1)
-                    ), dim=1)
-                seqlen = image_text_seq.shape[1]
-                attention_mask = torch.zeros(seqlen, seqlen, device=args.device, dtype=torch.long)
-                attention_mask[:, :400] = 1
-                attention_mask[400:, 400:] = 1
-                attention_mask[400:, 400:].tril_()
-                position_ids = torch.zeros(seqlen, device=args.device, dtype=torch.long)
-                torch.arange(513, 513+400, out=position_ids[:400])
-                torch.arange(0, seqlen-400, out=position_ids[400:])
-                loss_mask = torch.zeros(seqlen, device=args.device, dtype=torch.long)
-                loss_mask[401:] = 1
-                scores = evaluate_perplexity(
-                    text_model, image_text_seq, attention_mask,
-                    position_ids, loss_mask#, invalid_slices=[slice(0, 20000)], reduction='mean'
-                )
-                score_list.extend(scores.tolist())
-                # ---------------------
-            
-            output_list.append(
-                    coarse_samples
-                )
-        output_tokens = torch.cat(output_list, dim=0)
-        
-        if args.inverse_prompt:
-            order_list = np.argsort(score_list)[::-1]
-            print(sorted(score_list))
-        else:
-            order_list = range(output_tokens.shape[0])
-            
-        imgs, txts = [], []
-        if args.only_first_stage:
-            for i in order_list:
-                seq = output_tokens[i]
-                decoded_img = tokenizer.decode(image_ids=seq[-400:])
-                decoded_img = torch.nn.functional.interpolate(decoded_img, size=(480, 480))
-                imgs.append(decoded_img) # only the last image (target)
-        if not args.only_first_stage: # sr
-            iter_tokens = srg.sr_base(output_tokens[:, -400:], seq[:txt_len])
-            for seq in iter_tokens:
-                decoded_img = tokenizer.decode(image_ids=seq[-3600:])
-                decoded_img = torch.nn.functional.interpolate(decoded_img, size=(480, 480))
-                imgs.append(decoded_img) # only the last image (target)
+                order_list = np.argsort(score_list)[::-1]
+                print(sorted(score_list))
+            else:
+                order_list = range(output_tokens.shape[0])
 
-        # save 
-        if args.with_id:
-            full_path = os.path.join(args.output_path, query_id)
-            os.makedirs(full_path, exist_ok=True)
-            save_multiple_images(imgs, full_path, False)
-        else: 
-            prefix = raw_text.replace('/', '')[:20]
-            full_path = timed_name(prefix, '.jpeg', args.output_path)
-            imgs = torch.cat(imgs, dim=0)
-            print("\nSave to: ", full_path, flush=True)
-            from PIL import Image
-            from torchvision.utils import make_grid
-            grid = make_grid(imgs, nrow=3, padding=0)
-            # Add 0.5 after unnormalizing to [0, 255] to round to nearest integer
-            ndarr = grid.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to('cpu', torch.uint8).numpy()
-            im = Image.fromarray(ndarr)
-            im.save(full_path, quality=100, subsampling=0)
+            imgs, txts = [], []
+            if args.only_first_stage:
+                for i in order_list:
+                    seq = output_tokens[i]
+                    decoded_img = tokenizer.decode(image_ids=seq[-400:])
+                    decoded_img = torch.nn.functional.interpolate(decoded_img, size=(480, 480))
+                    imgs.append(decoded_img) # only the last image (target)
+            if not args.only_first_stage: # sr
+                iter_tokens = srg.sr_base(output_tokens[:, -400:], seq[:txt_len])
+                for seq in iter_tokens:
+                    decoded_img = tokenizer.decode(image_ids=seq[-3600:])
+                    decoded_img = torch.nn.functional.interpolate(decoded_img, size=(480, 480))
+                    imgs.append(decoded_img) # only the last image (target)
+
+            # save
+            if args.with_id:
+                full_path = os.path.join(args.output_path, query_id)
+                os.makedirs(full_path, exist_ok=True)
+                save_multiple_images(imgs, full_path, False)
+            else:
+                prefix = raw_text.replace('/', '')[:20]
+                full_path = timed_name(prefix, '.jpeg', args.output_path)
+                imgs = torch.cat(imgs, dim=0)
+                print("\nSave to: ", full_path, flush=True)
+                from PIL import Image
+                from torchvision.utils import make_grid
+                grid = make_grid(imgs, nrow=3, padding=0)
+                # Add 0.5 after unnormalizing to [0, 255] to round to nearest integer
+                ndarr = grid.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to('cpu', torch.uint8).numpy()
+                im = Image.fromarray(ndarr)
+                im.save(full_path, quality=100, subsampling=0)
+                return full_path
     
     os.makedirs(args.output_path, exist_ok=True)
-    generate_continually(process, args.input_source)
+    if not args.gradio:
+        generate_continually(process, args.input_source)
+    else:
+        demo = gr.Interface(fn=process, inputs="text", outputs="image")
+        demo.launch()
 
 class InferenceModel(CachedAutoregressiveModel):
     def final_forward(self, logits, **kwargs):
@@ -226,6 +233,7 @@ if __name__ == "__main__":
     py_parser.add_argument('--inverse-prompt', action='store_true')
     py_parser.add_argument('--style', type=str, default='mainbody', 
         choices=['none', 'mainbody', 'photo', 'flat', 'comics', 'oil', 'sketch', 'isometric', 'chinese', 'watercolor'])
+    py_parser.add_argument('--gradio', action='store_true')
     known, args_list = py_parser.parse_known_args()
     args = get_args(args_list)
     args = argparse.Namespace(**vars(args), **vars(known), **get_recipe(known.style))
