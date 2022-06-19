@@ -51,6 +51,7 @@ Arguments useful in inference are mainly:
 * `--inverse-prompt`. Use the perplexity to generate the original text to sort the generated images.
 * `--only-first-stage`. 
 * `--style`. The style of the generated images, choices=['none', 'mainbody', 'photo', 'flat', 'comics', 'oil', 'sketch', 'isometric', 'chinese', 'watercolor']. The default style is `mainbody`, usually an isolated object with white background.
+* `--gradio`. Creating a Gradio interface for generating images.
 
 You'd better specify a environment variable `SAT_HOME` to specify the path to store the downloaded model.
 
